@@ -36,7 +36,7 @@ public abstract class AbstractNioMessageChannel extends AbstractNioChannel {
     boolean inputShutdown;
 
     /**
-     * @see {@link AbstractNioChannel#AbstractNioChannel(Channel, SelectableChannel, int)}
+     * @see AbstractNioChannel#AbstractNioChannel(Channel, SelectableChannel, int)
      */
     protected AbstractNioMessageChannel(Channel parent, SelectableChannel ch, int readInterestOp) {
         super(parent, ch, readInterestOp);
@@ -176,7 +176,7 @@ public abstract class AbstractNioMessageChannel extends AbstractNioChannel {
         // accepting incoming connections. (e.g. too many open files)
         return cause instanceof IOException &&
                 !(cause instanceof PortUnreachableException) &&
-                this instanceof ServerChannel;
+                !(this instanceof ServerChannel);
     }
 
     /**

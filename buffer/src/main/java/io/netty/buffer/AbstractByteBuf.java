@@ -1308,13 +1308,7 @@ public abstract class AbstractByteBuf extends ByteBuf {
 
     @Override
     public boolean equals(Object o) {
-        if (this == o) {
-            return true;
-        }
-        if (o instanceof ByteBuf) {
-            return ByteBufUtil.equals(this, (ByteBuf) o);
-        }
-        return false;
+        return this == o || (o instanceof ByteBuf && ByteBufUtil.equals(this, (ByteBuf) o));
     }
 
     @Override
@@ -1387,6 +1381,13 @@ public abstract class AbstractByteBuf extends ByteBuf {
             throw new IllegalArgumentException("minimumReadableBytes: " + minimumReadableBytes + " (expected: >= 0)");
         }
         checkReadableBytes0(minimumReadableBytes);
+    }
+
+    protected final void checkNewCapacity(int newCapacity) {
+        ensureAccessible();
+        if (newCapacity < 0 || newCapacity > maxCapacity()) {
+            throw new IllegalArgumentException("newCapacity: " + newCapacity + " (expected: 0-" + maxCapacity() + ')');
+        }
     }
 
     private void checkReadableBytes0(int minimumReadableBytes) {

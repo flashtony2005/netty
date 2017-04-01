@@ -251,31 +251,49 @@ public final class HttpUtil {
     }
 
     /**
-     * Returns {@code true} if and only if the specified message contains the
-     * {@code "Expect: 100-continue"} header.
+     * Returns {@code true} if and only if the specified message contains an expect header and the only expectation
+     * present is the 100-continue expectation. Note that this method returns {@code false} if the expect header is
+     * not valid for the message (e.g., the message is a response, or the version on the message is HTTP/1.0).
+     *
+     * @param message the message
+     * @return {@code true} if and only if the expectation 100-continue is present and it is the only expectation
+     * present
      */
     public static boolean is100ContinueExpected(HttpMessage message) {
-        // Expect: 100-continue is for requests only.
-        if (!(message instanceof HttpRequest)) {
+        if (!isExpectHeaderValid(message)) {
             return false;
         }
 
-        // It works only on HTTP/1.1 or later.
-        if (message.protocolVersion().compareTo(HttpVersion.HTTP_1_1) < 0) {
+        final String expectValue = message.headers().get(HttpHeaderNames.EXPECT);
+        // unquoted tokens in the expect header are case-insensitive, thus 100-continue is case insensitive
+        return HttpHeaderValues.CONTINUE.toString().equalsIgnoreCase(expectValue);
+    }
+
+    /**
+     * Returns {@code true} if the specified message contains an expect header specifying an expectation that is not
+     * supported. Note that this method returns {@code false} if the expect header is not valid for the message
+     * (e.g., the message is a response, or the version on the message is HTTP/1.0).
+     *
+     * @param message the message
+     * @return {@code true} if and only if an expectation is present that is not supported
+     */
+    static boolean isUnsupportedExpectation(HttpMessage message) {
+        if (!isExpectHeaderValid(message)) {
             return false;
         }
 
-        // In most cases, there will be one or zero 'Expect' header.
-        CharSequence value = message.headers().get(HttpHeaderNames.EXPECT);
-        if (value == null) {
-            return false;
-        }
-        if (HttpHeaderValues.CONTINUE.contentEqualsIgnoreCase(value)) {
-            return true;
-        }
+        final String expectValue = message.headers().get(HttpHeaderNames.EXPECT);
+        return expectValue != null && !HttpHeaderValues.CONTINUE.toString().equalsIgnoreCase(expectValue);
+    }
 
-        // Multiple 'Expect' headers.  Search through them.
-        return message.headers().contains(HttpHeaderNames.EXPECT, HttpHeaderValues.CONTINUE, true);
+    private static boolean isExpectHeaderValid(final HttpMessage message) {
+        /*
+         * Expect: 100-continue is for requests only and it works only on HTTP/1.1 or later. Note further that RFC 7231
+         * section 5.1.1 says "A server that receives a 100-continue expectation in an HTTP/1.0 request MUST ignore
+         * that expectation."
+         */
+        return message instanceof HttpRequest &&
+                message.protocolVersion().compareTo(HttpVersion.HTTP_1_1) >= 0;
     }
 
     /**
@@ -312,7 +330,7 @@ public final class HttpUtil {
      */
     public static void setTransferEncodingChunked(HttpMessage m, boolean chunked) {
         if (chunked) {
-            m.headers().add(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
+            m.headers().set(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
             m.headers().remove(HttpHeaderNames.CONTENT_LENGTH);
         } else {
             List<String> encodings = m.headers().getAll(HttpHeaderNames.TRANSFER_ENCODING);
@@ -352,7 +370,7 @@ public final class HttpUtil {
      * if charset is not presented or unparsable
      */
     public static Charset getCharset(HttpMessage message, Charset defaultCharset) {
-        CharSequence charsetCharSequence = getCharsetAsString(message);
+        CharSequence charsetCharSequence = getCharsetAsSequence(message);
         if (charsetCharSequence != null) {
             try {
                 return Charset.forName(charsetCharSequence.toString());
@@ -372,8 +390,23 @@ public final class HttpUtil {
      *
      * @return the {@code CharSequence} with charset from message's Content-Type header
      * or {@code null} if charset is not presented
+     * @deprecated use {@link #getCharsetAsSequence(HttpMessage)}
      */
+    @Deprecated
     public static CharSequence getCharsetAsString(HttpMessage message) {
+        return getCharsetAsSequence(message);
+    }
+
+    /**
+     * Fetch charset from message's Content-Type header as a char sequence.
+     *
+     * A lot of sites/possibly clients have charset="CHARSET", for example charset="utf-8". Or "utf8" instead of "utf-8"
+     * This is not according to standard, but this method provide an ability to catch desired mistakes manually in code
+     *
+     * @return the {@code CharSequence} with charset from message's Content-Type header
+     * or {@code null} if charset is not presented
+     */
+    public static CharSequence getCharsetAsSequence(HttpMessage message) {
         CharSequence contentTypeValue = message.headers().get(HttpHeaderNames.CONTENT_TYPE);
         if (contentTypeValue != null) {
             int indexOfCharset = AsciiString.indexOfIgnoreCaseAscii(contentTypeValue, CHARSET_EQUALS, 0);

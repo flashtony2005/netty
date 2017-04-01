@@ -69,7 +69,6 @@ public class LzmaFrameEncoderTest extends AbstractEncoderTest {
         while ((msg = channel.readOutbound()) != null) {
             ByteBuf decompressedMsg = decompress(msg, originalLengths.get(i++));
             decompressed.addComponent(true, decompressedMsg);
-            msg.release();
         }
         assertEquals(originalLengths.size(), i);
         assertEquals(data, decompressed);
@@ -98,7 +97,11 @@ public class LzmaFrameEncoderTest extends AbstractEncoderTest {
         } finally {
             if (lzmaIs != null) {
                 lzmaIs.close();
-            } else {
+            }
+            // LzmaInputStream does not close the stream it wraps, so we should always close.
+            // The close operation should be safe to call multiple times anyways so lets just call it and be safe.
+            // https://github.com/jponge/lzma-java/issues/14
+            if (is != null) {
                 is.close();
             }
         }

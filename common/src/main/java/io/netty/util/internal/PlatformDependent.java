@@ -15,9 +15,6 @@
  */
 package io.netty.util.internal;
 
-import io.netty.util.CharsetUtil;
-import io.netty.util.internal.chmv8.ConcurrentHashMapV8;
-import io.netty.util.internal.chmv8.LongAdderV8;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import org.jctools.queues.MpscArrayQueue;
@@ -29,14 +26,8 @@ import org.jctools.queues.atomic.SpscLinkedAtomicQueue;
 import org.jctools.util.Pow2;
 import org.jctools.util.UnsafeAccess;
 
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.net.InetSocketAddress;
-import java.net.ServerSocket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.security.AccessController;
@@ -46,14 +37,12 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicLongFieldUpdater;
-import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -78,17 +67,18 @@ public final class PlatformDependent {
     private static final Pattern MAX_DIRECT_MEMORY_SIZE_ARG_PATTERN = Pattern.compile(
             "\\s*-XX:MaxDirectMemorySize\\s*=\\s*([0-9]+)\\s*([kKmMgG]?)\\s*$");
 
+    // this must be initialized before any code below triggers initialization of PlatformDependent0
+    private static final boolean IS_EXPLICIT_NO_UNSAFE = explicitNoUnsafe0();
+
     private static final boolean IS_ANDROID = isAndroid0();
     private static final boolean IS_WINDOWS = isWindows0();
-    private static volatile Boolean IS_ROOT;
+    private static final boolean MAYBE_SUPER_USER;
 
     private static final int JAVA_VERSION = javaVersion0();
 
     private static final boolean CAN_ENABLE_TCP_NODELAY_BY_DEFAULT = !isAndroid();
 
-    private static final boolean IS_EXPLICIT_NO_UNSAFE = explicitNoUnsafe0();
     private static final boolean HAS_UNSAFE = hasUnsafe0();
-    private static final boolean CAN_USE_CHM_V8 = HAS_UNSAFE && JAVA_VERSION < 8;
     private static final boolean DIRECT_BUFFER_PREFERRED =
             HAS_UNSAFE && !SystemPropertyUtil.getBoolean("io.netty.noPreferDirect", false);
     private static final long MAX_DIRECT_MEMORY = maxDirectMemory0();
@@ -100,8 +90,6 @@ public final class PlatformDependent {
 
     private static final long BYTE_ARRAY_BASE_OFFSET = byteArrayBaseOffset0();
 
-    private static final boolean HAS_JAVASSIST = hasJavassist0();
-
     private static final File TMPDIR = tmpdir0();
 
     private static final int BIT_MODE = bitMode0();
@@ -110,10 +98,26 @@ public final class PlatformDependent {
     private static final boolean USE_DIRECT_BUFFER_NO_CLEANER;
     private static final AtomicLong DIRECT_MEMORY_COUNTER;
     private static final long DIRECT_MEMORY_LIMIT;
+    private static final ThreadLocalRandomProvider RANDOM_PROVIDER;
 
     public static final boolean BIG_ENDIAN_NATIVE_ORDER = ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN;
 
     static {
+        if (javaVersion() >= 7) {
+            RANDOM_PROVIDER = new ThreadLocalRandomProvider() {
+                @Override
+                public Random current() {
+                    return java.util.concurrent.ThreadLocalRandom.current();
+                }
+            };
+        } else {
+            RANDOM_PROVIDER = new ThreadLocalRandomProvider() {
+                @Override
+                public Random current() {
+                    return ThreadLocalRandom.current();
+                }
+            };
+        }
         if (logger.isDebugEnabled()) {
             logger.debug("-Dio.netty.noPreferDirect: {}", !DIRECT_BUFFER_PREFERRED);
         }
@@ -152,6 +156,8 @@ public final class PlatformDependent {
         }
         DIRECT_MEMORY_LIMIT = maxDirectMemory;
         logger.debug("io.netty.maxDirectMemory: {} bytes", maxDirectMemory);
+
+        MAYBE_SUPER_USER = maybeSuperUser0();
     }
 
     /**
@@ -169,18 +175,11 @@ public final class PlatformDependent {
     }
 
     /**
-     * Return {@code true} if the current user is root.  Note that this method returns
-     * {@code false} if on Windows.
+     * Return {@code true} if the current user may be a super-user. Be aware that this is just an hint and so it may
+     * return false-positives.
      */
-    public static boolean isRoot() {
-        if (IS_ROOT == null) {
-            synchronized (PlatformDependent.class) {
-                if (IS_ROOT == null) {
-                    IS_ROOT = isRoot0();
-                }
-            }
-        }
-        return IS_ROOT;
+    public static boolean maybeSuperUser() {
+        return MAYBE_SUPER_USER;
     }
 
     /**
@@ -227,13 +226,6 @@ public final class PlatformDependent {
      */
     public static long maxDirectMemory() {
         return MAX_DIRECT_MEMORY;
-    }
-
-    /**
-     * Returns {@code true} if and only if Javassist is available.
-     */
-    public static boolean hasJavassist() {
-        return HAS_JAVASSIST;
     }
 
     /**
@@ -286,19 +278,15 @@ public final class PlatformDependent {
      * Creates a new fastest {@link ConcurrentMap} implementaion for the current platform.
      */
     public static <K, V> ConcurrentMap<K, V> newConcurrentHashMap() {
-        if (CAN_USE_CHM_V8) {
-            return new ConcurrentHashMapV8<K, V>();
-        } else {
-            return new ConcurrentHashMap<K, V>();
-        }
+        return new ConcurrentHashMap<K, V>();
     }
 
     /**
      * Creates a new fastest {@link LongCounter} implementaion for the current platform.
      */
     public static LongCounter newLongCounter() {
-        if (HAS_UNSAFE) {
-            return new LongAdderV8();
+        if (javaVersion() >= 8) {
+            return new LongAdderCounter();
         } else {
             return new AtomicLongCounter();
         }
@@ -308,22 +296,14 @@ public final class PlatformDependent {
      * Creates a new fastest {@link ConcurrentMap} implementaion for the current platform.
      */
     public static <K, V> ConcurrentMap<K, V> newConcurrentHashMap(int initialCapacity) {
-        if (CAN_USE_CHM_V8) {
-            return new ConcurrentHashMapV8<K, V>(initialCapacity);
-        } else {
-            return new ConcurrentHashMap<K, V>(initialCapacity);
-        }
+        return new ConcurrentHashMap<K, V>(initialCapacity);
     }
 
     /**
      * Creates a new fastest {@link ConcurrentMap} implementaion for the current platform.
      */
     public static <K, V> ConcurrentMap<K, V> newConcurrentHashMap(int initialCapacity, float loadFactor) {
-        if (CAN_USE_CHM_V8) {
-            return new ConcurrentHashMapV8<K, V>(initialCapacity, loadFactor);
-        } else {
-            return new ConcurrentHashMap<K, V>(initialCapacity, loadFactor);
-        }
+        return new ConcurrentHashMap<K, V>(initialCapacity, loadFactor);
     }
 
     /**
@@ -331,22 +311,14 @@ public final class PlatformDependent {
      */
     public static <K, V> ConcurrentMap<K, V> newConcurrentHashMap(
             int initialCapacity, float loadFactor, int concurrencyLevel) {
-        if (CAN_USE_CHM_V8) {
-            return new ConcurrentHashMapV8<K, V>(initialCapacity, loadFactor, concurrencyLevel);
-        } else {
-            return new ConcurrentHashMap<K, V>(initialCapacity, loadFactor, concurrencyLevel);
-        }
+        return new ConcurrentHashMap<K, V>(initialCapacity, loadFactor, concurrencyLevel);
     }
 
     /**
      * Creates a new fastest {@link ConcurrentMap} implementaion for the current platform.
      */
     public static <K, V> ConcurrentMap<K, V> newConcurrentHashMap(Map<? extends K, ? extends V> map) {
-        if (CAN_USE_CHM_V8) {
-            return new ConcurrentHashMapV8<K, V>(map);
-        } else {
-            return new ConcurrentHashMap<K, V>(map);
-        }
+        return new ConcurrentHashMap<K, V>(map);
     }
 
     /**
@@ -373,20 +345,8 @@ public final class PlatformDependent {
                 "sun.misc.Unsafe or java.nio.DirectByteBuffer.<init>(long, int) not available");
     }
 
-    public static Object getObject(Object object, long fieldOffset) {
-        return PlatformDependent0.getObject(object, fieldOffset);
-    }
-
-    public static Object getObjectVolatile(Object object, long fieldOffset) {
-        return PlatformDependent0.getObjectVolatile(object, fieldOffset);
-    }
-
     public static int getInt(Object object, long fieldOffset) {
         return PlatformDependent0.getInt(object, fieldOffset);
-    }
-
-    public static long objectFieldOffset(Field field) {
-        return PlatformDependent0.objectFieldOffset(field);
     }
 
     public static byte getByte(long address) {
@@ -515,10 +475,6 @@ public final class PlatformDependent {
      */
     private static int hashCodeAsciiSanitizsByte(char value) {
         return value & 0x1f;
-    }
-
-    public static void putOrderedObject(Object object, long address, Object value) {
-        PlatformDependent0.putOrderedObject(object, address, value);
     }
 
     public static void putByte(long address, byte value) {
@@ -796,57 +752,6 @@ public final class PlatformDependent {
         }
     }
 
-    /**
-     * Create a new optimized {@link AtomicReferenceFieldUpdater} or {@code null} if it
-     * could not be created. Because of this the caller need to check for {@code null} and if {@code null} is returned
-     * use {@link AtomicReferenceFieldUpdater#newUpdater(Class, Class, String)} as fallback.
-     */
-    public static <U, W> AtomicReferenceFieldUpdater<U, W> newAtomicReferenceFieldUpdater(
-            Class<? super U> tclass, String fieldName) {
-        if (hasUnsafe()) {
-            try {
-                return PlatformDependent0.newAtomicReferenceFieldUpdater(tclass, fieldName);
-            } catch (Throwable ignore) {
-                // ignore
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Create a new optimized {@link AtomicIntegerFieldUpdater} or {@code null} if it
-     * could not be created. Because of this the caller need to check for {@code null} and if {@code null} is returned
-     * use {@link AtomicIntegerFieldUpdater#newUpdater(Class, String)} as fallback.
-     */
-    public static <T> AtomicIntegerFieldUpdater<T> newAtomicIntegerFieldUpdater(
-            Class<? super T> tclass, String fieldName) {
-        if (hasUnsafe()) {
-            try {
-                return PlatformDependent0.newAtomicIntegerFieldUpdater(tclass, fieldName);
-            } catch (Throwable ignore) {
-                // ignore
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Create a new optimized {@link AtomicLongFieldUpdater} or {@code null} if it
-     * could not be created. Because of this the caller need to check for {@code null} and if {@code null} is returned
-     * use {@link AtomicLongFieldUpdater#newUpdater(Class, String)} as fallback.
-     */
-    public static <T> AtomicLongFieldUpdater<T> newAtomicLongFieldUpdater(
-            Class<? super T> tclass, String fieldName) {
-        if (hasUnsafe()) {
-            try {
-                return PlatformDependent0.newAtomicLongFieldUpdater(tclass, fieldName);
-            } catch (Throwable ignore) {
-                // ignore
-            }
-        }
-        return null;
-    }
-
     private static final class Mpsc {
         private static final boolean USE_MPSC_CHUNKED_ARRAY_QUEUE;
 
@@ -884,7 +789,7 @@ public final class PlatformDependent {
                 // up to the next power of two and so will overflow otherwise.
                 final int capacity =
                         Math.max(Math.min(maxCapacity, MAX_ALLOWED_MPSC_CAPACITY), MIN_MAX_MPSC_CAPACITY);
-                return new MpscChunkedArrayQueue<T>(MPSC_CHUNK_SIZE, capacity, true);
+                return new MpscChunkedArrayQueue<T>(MPSC_CHUNK_SIZE, capacity);
             } else {
                 return new MpscLinkedAtomicQueue<T>();
             }
@@ -955,6 +860,13 @@ public final class PlatformDependent {
         }
     }
 
+    /**
+     * Return a {@link Random} which is not-threadsafe and so can only be used from the same thread.
+     */
+    public static Random threadLocalRandom() {
+        return RANDOM_PROVIDER.current();
+    }
+
     private static boolean isAndroid0() {
         boolean android;
         try {
@@ -979,97 +891,13 @@ public final class PlatformDependent {
         return windows;
     }
 
-    private static boolean isRoot0() {
+    private static boolean maybeSuperUser0() {
+        String username = SystemPropertyUtil.get("user.name");
         if (isWindows()) {
-            return false;
+            return "Administrator".equals(username);
         }
-
-        String[] ID_COMMANDS = { "/usr/bin/id", "/bin/id", "/usr/xpg4/bin/id", "id"};
-        Pattern UID_PATTERN = Pattern.compile("^(?:0|[1-9][0-9]*)$");
-        for (String idCmd: ID_COMMANDS) {
-            Process p = null;
-            BufferedReader in = null;
-            String uid = null;
-            try {
-                p = Runtime.getRuntime().exec(new String[] { idCmd, "-u" });
-                in = new BufferedReader(new InputStreamReader(p.getInputStream(), CharsetUtil.US_ASCII));
-                uid = in.readLine();
-                in.close();
-
-                for (;;) {
-                    try {
-                        int exitCode = p.waitFor();
-                        if (exitCode != 0) {
-                            uid = null;
-                        }
-                        break;
-                    } catch (InterruptedException e) {
-                        // Ignore
-                    }
-                }
-            } catch (Throwable ignored) {
-                // Failed to run the command.
-                uid = null;
-            } finally {
-                if (in != null) {
-                    try {
-                        in.close();
-                    } catch (IOException e) {
-                        // Ignore
-                    }
-                }
-                if (p != null) {
-                    try {
-                        p.destroy();
-                    } catch (Exception e) {
-                        // Android sometimes triggers an ErrnoException.
-                    }
-                }
-            }
-
-            if (uid != null && UID_PATTERN.matcher(uid).matches()) {
-                logger.debug("UID: {}", uid);
-                return "0".equals(uid);
-            }
-        }
-
-        logger.debug("Could not determine the current UID using /usr/bin/id; attempting to bind at privileged ports.");
-
-        Pattern PERMISSION_DENIED = Pattern.compile(".*(?:denied|not.*permitted).*");
-        for (int i = 1023; i > 0; i --) {
-            ServerSocket ss = null;
-            try {
-                ss = new ServerSocket();
-                ss.setReuseAddress(true);
-                ss.bind(new InetSocketAddress(i));
-                if (logger.isDebugEnabled()) {
-                    logger.debug("UID: 0 (succeded to bind at port {})", i);
-                }
-                return true;
-            } catch (Exception e) {
-                // Failed to bind.
-                // Check the error message so that we don't always need to bind 1023 times.
-                String message = e.getMessage();
-                if (message == null) {
-                    message = "";
-                }
-                message = message.toLowerCase();
-                if (PERMISSION_DENIED.matcher(message).matches()) {
-                    break;
-                }
-            } finally {
-                if (ss != null) {
-                    try {
-                        ss.close();
-                    } catch (Exception e) {
-                        // Ignore.
-                    }
-                }
-            }
-        }
-
-        logger.debug("UID: non-root (failed to bind at any privileged ports)");
-        return false;
+        // Check for root and toor as some BSDs have a toor user that is basically the same as root.
+        return "root".equals(username) || "toor".equals(username);
     }
 
     private static int javaVersion0() {
@@ -1087,18 +915,7 @@ public final class PlatformDependent {
     }
 
     static int majorVersionFromJavaSpecificationVersion() {
-        try {
-            final String javaSpecVersion = AccessController.doPrivileged(new PrivilegedAction<String>() {
-                @Override
-                public String run() {
-                    return System.getProperty("java.specification.version");
-                }
-            });
-            return majorVersion(javaSpecVersion);
-        } catch (SecurityException e) {
-            logger.debug("security exception while reading java.specification.version", e);
-            return 6;
-        }
+        return majorVersion(SystemPropertyUtil.get("java.specification.version", "1.6"));
     }
 
     static int majorVersion(final String javaSpecVersion) {
@@ -1114,6 +931,10 @@ public final class PlatformDependent {
         } else {
             return version[0];
         }
+    }
+
+    static boolean isExplicitNoUnsafe() {
+        return IS_EXPLICIT_NO_UNSAFE;
     }
 
     private static boolean explicitNoUnsafe0() {
@@ -1163,9 +984,11 @@ public final class PlatformDependent {
 
     private static long maxDirectMemory0() {
         long maxDirectMemory = 0;
+        ClassLoader systemClassLoader = null;
         try {
             // Try to get from sun.misc.VM.maxDirectMemory() which should be most accurate.
-            Class<?> vmClass = Class.forName("sun.misc.VM", true, getSystemClassLoader());
+            systemClassLoader = getSystemClassLoader();
+            Class<?> vmClass = Class.forName("sun.misc.VM", true, systemClassLoader);
             Method m = vmClass.getDeclaredMethod("maxDirectMemory");
             maxDirectMemory = ((Number) m.invoke(null)).longValue();
         } catch (Throwable ignored) {
@@ -1180,9 +1003,9 @@ public final class PlatformDependent {
             // Now try to get the JVM option (-XX:MaxDirectMemorySize) and parse it.
             // Note that we are using reflection because Android doesn't have these classes.
             Class<?> mgmtFactoryClass = Class.forName(
-                    "java.lang.management.ManagementFactory", true, getSystemClassLoader());
+                    "java.lang.management.ManagementFactory", true, systemClassLoader);
             Class<?> runtimeClass = Class.forName(
-                    "java.lang.management.RuntimeMXBean", true, getSystemClassLoader());
+                    "java.lang.management.RuntimeMXBean", true, systemClassLoader);
 
             Object runtime = mgmtFactoryClass.getDeclaredMethod("getRuntimeMXBean").invoke(null);
 
@@ -1220,33 +1043,6 @@ public final class PlatformDependent {
         }
 
         return maxDirectMemory;
-    }
-
-    private static boolean hasJavassist0() {
-        if (isAndroid()) {
-            return false;
-        }
-
-        boolean noJavassist = SystemPropertyUtil.getBoolean("io.netty.noJavassist", false);
-        logger.debug("-Dio.netty.noJavassist: {}", noJavassist);
-
-        if (noJavassist) {
-            logger.debug("Javassist: unavailable (io.netty.noJavassist)");
-            return false;
-        }
-
-        try {
-            JavassistTypeParameterMatcherGenerator.generate(Object.class, getClassLoader(PlatformDependent.class));
-            logger.debug("Javassist: available");
-            return true;
-        } catch (Throwable t) {
-            // Failed to generate a Javassist-based matcher.
-            logger.debug("Javassist: unavailable");
-            logger.debug(
-                    "You don't have Javassist in your class path or you don't have enough permission " +
-                    "to load dynamically generated classes.  Please check the configuration for better performance.");
-            return false;
-        }
     }
 
     private static File tmpdir0() {
@@ -1452,6 +1248,10 @@ public final class PlatformDependent {
         public long value() {
             return get();
         }
+    }
+
+    private interface ThreadLocalRandomProvider {
+        Random current();
     }
 
     private PlatformDependent() {

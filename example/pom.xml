@@ -21,7 +21,7 @@
   <parent>
     <groupId>io.netty</groupId>
     <artifactId>netty-parent</artifactId>
-    <version>4.1.7.Final-SNAPSHOT</version>
+    <version>4.1.10.Final-SNAPSHOT</version>
   </parent>
 
   <artifactId>netty-example</artifactId>
@@ -88,6 +88,11 @@
       <groupId>${project.groupId}</groupId>
       <artifactId>${tcnative.artifactId}</artifactId>
       <classifier>${tcnative.classifier}</classifier>
+    </dependency>
+    <dependency>
+      <groupId>${conscrypt.groupId}</groupId>
+      <artifactId>${conscrypt.artifactId}</artifactId>
+      <classifier>${conscrypt.classifier}</classifier>
     </dependency>
     <dependency>
       <groupId>org.eclipse.jetty.npn</groupId>

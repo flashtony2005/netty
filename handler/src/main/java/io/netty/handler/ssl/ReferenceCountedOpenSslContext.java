@@ -17,24 +17,24 @@ package io.netty.handler.ssl;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.internal.tcnative.CertificateVerifier;
+import io.netty.internal.tcnative.SSL;
+import io.netty.internal.tcnative.SSLContext;
 import io.netty.util.AbstractReferenceCounted;
 import io.netty.util.ReferenceCounted;
-import io.netty.util.ResourceLeak;
 import io.netty.util.ResourceLeakDetector;
 import io.netty.util.ResourceLeakDetectorFactory;
+import io.netty.util.ResourceLeakTracker;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
-import org.apache.tomcat.jni.CertificateVerifier;
-import org.apache.tomcat.jni.Pool;
-import org.apache.tomcat.jni.SSL;
-import org.apache.tomcat.jni.SSLContext;
 
 import java.security.AccessController;
 import java.security.PrivateKey;
 import java.security.PrivilegedAction;
+import java.security.cert.CertPathValidatorException;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateExpiredException;
 import java.security.cert.CertificateNotYetValidException;
@@ -45,7 +45,6 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLException;
@@ -57,6 +56,7 @@ import javax.net.ssl.X509KeyManager;
 import javax.net.ssl.X509TrustManager;
 
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
+import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
 
 /**
  * An implementation of {@link SslContext} which works with libraries that support the
@@ -85,6 +85,17 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
                     return SystemPropertyUtil.getBoolean("jdk.tls.rejectClientInitiatedRenegotiation", false);
                 }
             });
+
+    private static final int DEFAULT_BIO_NON_APPLICATION_BUFFER_SIZE =
+            AccessController.doPrivileged(new PrivilegedAction<Integer>() {
+                @Override
+                public Integer run() {
+                    return Math.max(1,
+                            SystemPropertyUtil.getInt("io.netty.handler.ssl.openssl.bioNonApplicationBufferSize",
+                                                      2048));
+                }
+            });
+
     private static final List<String> DEFAULT_CIPHERS;
     private static final Integer DH_KEY_LENGTH;
     private static final ResourceLeakDetector<ReferenceCountedOpenSslContext> leakDetector =
@@ -97,7 +108,6 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
      * The OpenSSL SSL_CTX object
      */
     protected volatile long ctx;
-    long aprPool;
     @SuppressWarnings({ "unused", "FieldMayBeFinal" })
     private volatile int aprPoolDestroyed;
     private final List<String> unmodifiableCiphers;
@@ -107,7 +117,7 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
     private final int mode;
 
     // Reference Counting
-    private final ResourceLeak leak;
+    private final ResourceLeakTracker<ReferenceCountedOpenSslContext> leak;
     private final AbstractReferenceCounted refCnt = new AbstractReferenceCounted() {
         @Override
         public ReferenceCounted touch(Object hint) {
@@ -122,15 +132,18 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
         protected void deallocate() {
             destroy();
             if (leak != null) {
-                leak.close();
+                boolean closed = leak.close(ReferenceCountedOpenSslContext.this);
+                assert closed;
             }
         }
     };
 
     final Certificate[] keyCertChain;
     final ClientAuth clientAuth;
+    final String[] protocols;
     final OpenSslEngineMap engineMap = new DefaultOpenSslEngineMap();
-    volatile boolean rejectRemoteInitiatedRenegotiation;
+    private volatile boolean rejectRemoteInitiatedRenegotiation;
+    private volatile int bioNonApplicationBufferSize = DEFAULT_BIO_NON_APPLICATION_BUFFER_SIZE;
 
     static final OpenSslApplicationProtocolNegotiator NONE_PROTOCOL_NEGOTIATOR =
             new OpenSslApplicationProtocolNegotiator() {
@@ -199,16 +212,17 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
 
     ReferenceCountedOpenSslContext(Iterable<String> ciphers, CipherSuiteFilter cipherFilter,
                                    ApplicationProtocolConfig apnCfg, long sessionCacheSize, long sessionTimeout,
-                                   int mode, Certificate[] keyCertChain, ClientAuth clientAuth, boolean startTls,
-                                   boolean leakDetection) throws SSLException {
+                                   int mode, Certificate[] keyCertChain, ClientAuth clientAuth, String[] protocols,
+                                   boolean startTls, boolean leakDetection) throws SSLException {
         this(ciphers, cipherFilter, toNegotiator(apnCfg), sessionCacheSize, sessionTimeout, mode, keyCertChain,
-                clientAuth, startTls, leakDetection);
+                clientAuth, protocols, startTls, leakDetection);
     }
 
     ReferenceCountedOpenSslContext(Iterable<String> ciphers, CipherSuiteFilter cipherFilter,
                                    OpenSslApplicationProtocolNegotiator apn, long sessionCacheSize,
                                    long sessionTimeout, int mode, Certificate[] keyCertChain,
-                                   ClientAuth clientAuth, boolean startTls, boolean leakDetection) throws SSLException {
+                                   ClientAuth clientAuth, String[] protocols, boolean startTls, boolean leakDetection)
+            throws SSLException {
         super(startTls);
 
         OpenSsl.ensureAvailability();
@@ -216,9 +230,10 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
         if (mode != SSL.SSL_MODE_SERVER && mode != SSL.SSL_MODE_CLIENT) {
             throw new IllegalArgumentException("mode most be either SSL.SSL_MODE_SERVER or SSL.SSL_MODE_CLIENT");
         }
-        leak = leakDetection ? leakDetector.open(this) : null;
+        leak = leakDetection ? leakDetector.track(this) : null;
         this.mode = mode;
         this.clientAuth = isServer() ? checkNotNull(clientAuth, "clientAuth") : ClientAuth.NONE;
+        this.protocols = protocols;
 
         if (mode == SSL.SSL_MODE_SERVER) {
             rejectRemoteInitiatedRenegotiation =
@@ -244,35 +259,33 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
         }
 
         unmodifiableCiphers = Arrays.asList(checkNotNull(cipherFilter, "cipherFilter").filterCipherSuites(
-                convertedCiphers, DEFAULT_CIPHERS, OpenSsl.availableCipherSuites()));
+                convertedCiphers, DEFAULT_CIPHERS, OpenSsl.availableOpenSslCipherSuites()));
 
         this.apn = checkNotNull(apn, "apn");
-
-        // Allocate a new APR pool.
-        aprPool = Pool.create(0);
 
         // Create a new SSL_CTX and configure it.
         boolean success = false;
         try {
             synchronized (ReferenceCountedOpenSslContext.class) {
                 try {
-                    ctx = SSLContext.make(aprPool, SSL.SSL_PROTOCOL_ALL, mode);
+                    ctx = SSLContext.make(SSL.SSL_PROTOCOL_ALL, mode);
                 } catch (Exception e) {
                     throw new SSLException("failed to create an SSL_CTX", e);
                 }
 
-                SSLContext.setOptions(ctx, SSL.SSL_OP_ALL);
-                SSLContext.setOptions(ctx, SSL.SSL_OP_NO_SSLv2);
-                SSLContext.setOptions(ctx, SSL.SSL_OP_NO_SSLv3);
-                SSLContext.setOptions(ctx, SSL.SSL_OP_CIPHER_SERVER_PREFERENCE);
-                SSLContext.setOptions(ctx, SSL.SSL_OP_SINGLE_ECDH_USE);
-                SSLContext.setOptions(ctx, SSL.SSL_OP_SINGLE_DH_USE);
-                SSLContext.setOptions(ctx, SSL.SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
+                SSLContext.setOptions(ctx, SSLContext.getOptions(ctx) |
+                        SSL.SSL_OP_NO_SSLv2 |
+                        SSL.SSL_OP_NO_SSLv3 |
+                        SSL.SSL_OP_CIPHER_SERVER_PREFERENCE |
+
+                // We do not support compression at the moment so we should explicitly disable it.
+                        SSL.SSL_OP_NO_COMPRESSION |
+
                 // Disable ticket support by default to be more inline with SSLEngineImpl of the JDK.
                 // This also let SSLSession.getId() work the same way for the JDK implementation and the OpenSSLEngine.
                 // If tickets are supported SSLSession.getId() will only return an ID on the server-side if it could
                 // make use of tickets.
-                SSLContext.setOptions(ctx, SSL.SSL_OP_NO_TICKET);
+                        SSL.SSL_OP_NO_TICKET);
 
                 // We need to enable SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER as the memory address may change between
                 // calling OpenSSLEngine.wrap(...).
@@ -295,19 +308,19 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
                 List<String> nextProtoList = apn.protocols();
                 /* Set next protocols for next protocol negotiation extension, if specified */
                 if (!nextProtoList.isEmpty()) {
-                    String[] protocols = nextProtoList.toArray(new String[nextProtoList.size()]);
+                    String[] appProtocols = nextProtoList.toArray(new String[nextProtoList.size()]);
                     int selectorBehavior = opensslSelectorFailureBehavior(apn.selectorFailureBehavior());
 
                     switch (apn.protocol()) {
                         case NPN:
-                            SSLContext.setNpnProtos(ctx, protocols, selectorBehavior);
+                            SSLContext.setNpnProtos(ctx, appProtocols, selectorBehavior);
                             break;
                         case ALPN:
-                            SSLContext.setAlpnProtos(ctx, protocols, selectorBehavior);
+                            SSLContext.setAlpnProtos(ctx, appProtocols, selectorBehavior);
                             break;
                         case NPN_AND_ALPN:
-                            SSLContext.setNpnProtos(ctx, protocols, selectorBehavior);
-                            SSLContext.setAlpnProtos(ctx, protocols, selectorBehavior);
+                            SSLContext.setNpnProtos(ctx, appProtocols, selectorBehavior);
+                            SSLContext.setAlpnProtos(ctx, appProtocols, selectorBehavior);
                             break;
                         default:
                             throw new Error();
@@ -430,6 +443,29 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
     }
 
     /**
+     * Returns if remote initiated renegotiation is supported or not.
+     */
+    public boolean getRejectRemoteInitiatedRenegotiation() {
+        return rejectRemoteInitiatedRenegotiation;
+    }
+
+    /**
+     * Set the size of the buffer used by the BIO for non-application based writes
+     * (e.g. handshake, renegotiation, etc...).
+     */
+    public void setBioNonApplicationBufferSize(int bioNonApplicationBufferSize) {
+        this.bioNonApplicationBufferSize =
+                checkPositiveOrZero(bioNonApplicationBufferSize, "bioNonApplicationBufferSize");
+    }
+
+    /**
+     * Returns the size of the buffer used by the BIO for non-application based writes
+     */
+    public int getBioNonApplicationBufferSize() {
+        return bioNonApplicationBufferSize;
+    }
+
+    /**
      * Sets the SSL session ticket keys of this context.
      *
      * @deprecated use {@link OpenSslSessionContext#setTicketKeys(byte[])}
@@ -459,12 +495,6 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
             if (ctx != 0) {
                 SSLContext.free(ctx);
                 ctx = 0;
-            }
-
-            // Guard against multiple destroyPools() calls triggered by construction exception and finalize() later
-            if (aprPool != 0) {
-                Pool.destroy(aprPool);
-                aprPool = 0;
             }
         }
     }
@@ -605,7 +635,10 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
                 e.initCause(cause);
                 engine.handshakeException = e;
 
+                // Try to extract the correct error code that should be used.
                 if (cause instanceof OpenSslCertificateException) {
+                    // This will never return a negative error code as its validated when constructing the
+                    // OpenSslCertificateException.
                     return ((OpenSslCertificateException) cause).errorCode();
                 }
                 if (cause instanceof CertificateExpiredException) {
@@ -614,9 +647,34 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
                 if (cause instanceof CertificateNotYetValidException) {
                     return CertificateVerifier.X509_V_ERR_CERT_NOT_YET_VALID;
                 }
-                if (PlatformDependent.javaVersion() >= 7 && cause instanceof CertificateRevokedException) {
-                    return CertificateVerifier.X509_V_ERR_CERT_REVOKED;
+                if (PlatformDependent.javaVersion() >= 7) {
+                    if (cause instanceof CertificateRevokedException) {
+                        return CertificateVerifier.X509_V_ERR_CERT_REVOKED;
+                    }
+
+                    // The X509TrustManagerImpl uses a Validator which wraps a CertPathValidatorException into
+                    // an CertificateException. So we need to handle the wrapped CertPathValidatorException to be
+                    // able to send the correct alert.
+                    Throwable wrapped = cause.getCause();
+                    while (wrapped != null) {
+                        if (wrapped instanceof CertPathValidatorException) {
+                            CertPathValidatorException ex = (CertPathValidatorException) wrapped;
+                            CertPathValidatorException.Reason reason = ex.getReason();
+                            if (reason == CertPathValidatorException.BasicReason.EXPIRED) {
+                                return CertificateVerifier.X509_V_ERR_CERT_HAS_EXPIRED;
+                            }
+                            if (reason == CertPathValidatorException.BasicReason.NOT_YET_VALID) {
+                                return CertificateVerifier.X509_V_ERR_CERT_NOT_YET_VALID;
+                            }
+                            if (reason == CertPathValidatorException.BasicReason.REVOKED) {
+                                return CertificateVerifier.X509_V_ERR_CERT_REVOKED;
+                            }
+                        }
+                        wrapped = wrapped.getCause();
+                    }
                 }
+
+                // Could not detect a specific error code to use, so fallback to a default code.
                 return CertificateVerifier.X509_V_ERR_UNSPECIFIED;
             }
         }
@@ -760,7 +818,7 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
         try {
             long bio = SSL.newMemBIO();
             int readable = buffer.readableBytes();
-            if (SSL.writeToBIO(bio, OpenSsl.memoryAddress(buffer) + buffer.readerIndex(), readable) != readable) {
+            if (SSL.bioWrite(bio, OpenSsl.memoryAddress(buffer) + buffer.readerIndex(), readable) != readable) {
                 SSL.freeBIO(bio);
                 throw new IllegalStateException("Could not write data to memory BIO");
             }

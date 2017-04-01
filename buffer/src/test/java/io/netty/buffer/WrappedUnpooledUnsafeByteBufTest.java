@@ -16,14 +16,26 @@
 package io.netty.buffer;
 
 import io.netty.util.internal.PlatformDependent;
+import org.junit.Assume;
+import org.junit.Before;
 import org.junit.Test;
 
 import java.io.IOException;
 
 public class WrappedUnpooledUnsafeByteBufTest extends BigEndianUnsafeDirectByteBufTest {
 
+    @Before
     @Override
-    protected ByteBuf newBuffer(int length) {
+    public void init() {
+        Assume.assumeTrue("PlatformDependent.useDirectBufferNoCleaner() returned false, skip tests",
+                PlatformDependent.useDirectBufferNoCleaner());
+        super.init();
+    }
+
+    @Override
+    protected ByteBuf newBuffer(int length, int maxCapacity) {
+        Assume.assumeTrue(maxCapacity == Integer.MAX_VALUE);
+
         return new WrappedUnpooledUnsafeDirectByteBuf(UnpooledByteBufAllocator.DEFAULT,
                 PlatformDependent.allocateMemory(length), length, true);
     }
